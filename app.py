@@ -70,22 +70,30 @@ def login_to_api(api_base_url, username="openplc", password="openplc"):
         return False, f"Erro ao conectar: {e}", None
 
 def send_api_request(api_base_url, address, value):
-    """Envia uma requisição para a API de controle."""
+    """Envia uma requisição para a API de controle sem esperar pela resposta."""
     url = f"{api_base_url}/point-write?value={value}&address={address}"
     print(f"url enviado {url}")
-    try:
-        # Usar a sessão autenticada se disponível
-        if 'api_session' in st.session_state and st.session_state.api_session:
-            response = st.session_state.api_session.get(url, timeout=3)
-        else:
-            response = requests.get(url, timeout=3)
-            
-        if response.status_code == 200:
-            return True, "Comando enviado com sucesso"
-        else:
-            return False, f"Erro na requisição: {response.status_code}"
-    except requests.exceptions.RequestException as e:
-        return False, f"Erro ao enviar comando: {e}"
+    
+    def send_request_async():
+        try:
+            # Usar a sessão autenticada se disponível
+            if 'api_session' in st.session_state and st.session_state.api_session:
+                response = st.session_state.api_session.get(url, timeout=3)
+            else:
+                response = requests.get(url, timeout=3)
+                
+            # Log do resultado sem bloquear o fluxo principal
+            print(f"Resposta recebida: {response.status_code}")
+        except requests.exceptions.RequestException as e:
+            print(f"Erro ao enviar comando: {e}")
+    
+    # Inicia a requisição em uma thread separada
+    thread = threading.Thread(target=send_request_async)
+    thread.daemon = True  # Garante que a thread não bloqueie a saída do programa
+    thread.start()
+    
+    # Retorna imediatamente sem esperar pela resposta
+    return True, "Comando enviado (não aguardando resposta)"
 
 def get_available_cameras():
     """Detecta cameras disponíveis no sistema."""
@@ -180,10 +188,10 @@ def main():
     
     # Configurações da janela de detecção
     st.sidebar.header("Configurações da Janela")
-    window_width = st.sidebar.slider("Largura da janela", 50, 500, 200)
-    window_height = st.sidebar.slider("Altura da janela", 50, 500, 200)
-    window_x = st.sidebar.slider("Posição X da janela", 0, 600, 250)
-    window_y = st.sidebar.slider("Posição Y da janela", 0, 400, 150)
+    window_width = st.sidebar.slider("Largura da janela", 50, 500, 80)
+    window_height = st.sidebar.slider("Altura da janela", 50, 500, 80)
+    window_x = st.sidebar.slider("Posição X da janela", 0, 600, 130)
+    window_y = st.sidebar.slider("Posição Y da janela", 0, 400, 365)
     
     # Configurações dos limites de detecção de cores
     st.sidebar.header("Configurações de Detecção")
@@ -211,6 +219,8 @@ def main():
         # Imprimir porta no terminal (em um thread separado para não bloquear)
         threading.Thread(target=print_running_port).start()
     
+    LAST_COLOR = "RED"
+
     # Função para enviar comandos para os dois pinos
     def send_color_command(api_base_url, pin1_value, pin2_value):
         """Envia comandos para os dois pinos."""
@@ -257,30 +267,38 @@ def main():
             g_count = np.sum(g_mask)
             b_count = np.sum(b_mask)
             
-            # Determinar a cor predominante
+            # Calcular a distância entre os valores médios das cores
+            rg_diff = abs(r_mean - g_mean)
+            rb_diff = abs(r_mean - b_mean)
+            gb_diff = abs(g_mean - b_mean)
+            
+            # Determinar a cor predominante considerando a distância
             color_text = "Nenhuma cor predominante detectada"
-            if r_count > min_required_pixels and r_mean > g_mean and r_mean > b_mean:
+            min_color_distance = 2  # Limiar para diferenciar cores
+            if r_count > min_required_pixels and r_mean > g_mean and r_mean > b_mean and rg_diff > min_color_distance and rb_diff > min_color_distance:
                 color_text = "VERMELHO detectado!"
                 color_box = (0, 0, 255)  # BGR para vermelho
                 current_color = "RED"
-            elif g_count > min_required_pixels and g_mean > r_mean and g_mean > b_mean:
+            elif g_count > min_required_pixels and g_mean > r_mean and g_mean > b_mean and rg_diff > min_color_distance and gb_diff > min_color_distance:
                 color_text = "VERDE detectado!"
                 color_box = (0, 255, 0)  # BGR para verde
                 current_color = "GREEN"
-            elif b_count > min_required_pixels and b_mean > r_mean and b_mean > g_mean:
+            elif b_count > min_required_pixels and b_mean > r_mean and b_mean > g_mean and rb_diff > min_color_distance and gb_diff > min_color_distance:
                 color_text = "AZUL detectado!"
                 color_box = (255, 0, 0)  # BGR para azul
                 current_color = "BLUE"
             else:
                 color_box = (200, 200, 200)  # Cinza
                 current_color = "NONE"
+
+            
             
             # Exibir resultado na imagem
             cv2.putText(frame, color_text, (20, 40), 
                        cv2.FONT_HERSHEY_SIMPLEX, 1, color_box, 2)
             
             # Mostrar os valores RGB
-            values_text = f"R: {r_mean:.1f} (pixels: {r_count}) | G: {g_mean:.1f} (pixels: {g_count}) | B: {b_mean:.1f} (pixels: {b_count})"
+            values_text = f"R: {r_mean:.1f} (pixels: {r_count}) | G: {g_mean:.1f} (pixels: {g_count}) | B: {b_mean:.1f} (pixels: {b_count}) | "
             color_values_placeholder.text(values_text)
             
             # Destacar a cor detectada na interface
@@ -288,30 +306,33 @@ def main():
                                        unsafe_allow_html=True)
             
             # Processar estados das cores e enviar comandos
-            if current_color == "RED":
+            if current_color == "RED" and LAST_COLOR != current_color:
                 success, message = send_color_command(api_base_url, 1, 0)  # 10
                 if success:
                     command_status_placeholder.success(f"Vermelho ativado: {message}")
                 else:
                     command_status_placeholder.error(f"Falha ao ativar vermelho: {message}")
-            elif current_color == "GREEN":
+            elif current_color == "GREEN" and LAST_COLOR != current_color:
                 success, message = send_color_command(api_base_url, 0, 1)  # 01
                 if success:
                     command_status_placeholder.success(f"Verde ativado: {message}")
                 else:
                     command_status_placeholder.error(f"Falha ao ativar verde: {message}")
-            elif current_color == "BLUE":
+            elif current_color == "BLUE" and LAST_COLOR != current_color:
                 success, message = send_color_command(api_base_url, 1, 1)  # 11
                 if success:
                     command_status_placeholder.success(f"Azul ativado: {message}")
                 else:
                     command_status_placeholder.error(f"Falha ao ativar azul: {message}")
-            else:  # Nenhuma cor detectada
+            elif current_color == "NONE" and LAST_COLOR != "NONE" :  # Nenhuma cor detectada
                 success, message = send_color_command(api_base_url, 0, 0)  # 00
                 if success:
                     command_status_placeholder.info(f"Nenhuma cor detectada: {message}")
                 else:
                     command_status_placeholder.error(f"Falha ao desativar pinos: {message}")
+
+            # print(f"current {current_color} last {LAST_COLOR}")
+            LAST_COLOR = current_color
             
         # Converter para RGB (Streamlit espera RGB, não BGR usado pelo OpenCV)
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -322,7 +343,7 @@ def main():
         cv2.waitKey(20)
     
     # Desligar todos os pinos ao parar
-    send_color_command(api_base_url, 0, 0)
+    # send_color_command(api_base_url, 0, 0)
     
     # Liberar a câmera quando terminar
     cap.release()
