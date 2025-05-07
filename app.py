@@ -87,6 +87,23 @@ def send_api_request(api_base_url, address, value):
     except requests.exceptions.RequestException as e:
         return False, f"Erro ao enviar comando: {e}"
 
+def get_available_cameras():
+    """Detecta cameras disponíveis no sistema."""
+    available_cameras = []
+    # Testar índices de 0 a 5 (normalmente suficiente para a maioria dos sistemas)
+    for i in range(6):
+        cap = cv2.VideoCapture(i)
+        if cap.isOpened():
+            # Ler um frame para confirmar que a câmera está funcionando
+            ret, frame = cap.read()
+            if ret:
+                available_cameras.append(i)
+            cap.release()
+    
+    if not available_cameras:
+        return [0]  # Retorna pelo menos a câmera padrão se nenhuma for encontrada
+    return available_cameras
+
 def main():
     st.title("Detector de Cores RGB com Webcam e Controle via API")
     st.write("Este aplicativo detecta cores e envia comandos via API HTTP.")
@@ -96,6 +113,23 @@ def main():
     api_ip = st.sidebar.text_input("Endereço IP do servidor", "172.172.23.5")
     api_port = st.sidebar.number_input("Porta da API", 1000, 9999, 2429)
     api_base_url = f"http://{api_ip}:{api_port}"
+    
+    # Configurações da câmera
+    st.sidebar.header("Configuração da Câmera")
+    # Detectar câmeras disponíveis apenas uma vez durante a inicialização
+    if 'available_cameras' not in st.session_state:
+        st.session_state.available_cameras = get_available_cameras()
+    
+    # Criar opções para o dropdown com nomes legíveis
+    camera_options = {f"Câmera {i}": i for i in st.session_state.available_cameras}
+    camera_names = list(camera_options.keys())
+    
+    selected_camera_name = st.sidebar.selectbox(
+        "Selecione a câmera",
+        camera_names,
+        index=0
+    )
+    selected_camera_index = camera_options[selected_camera_name]
     
     # Estados para controle das cores e temporizadores
     if 'last_color_state' not in st.session_state:
@@ -132,20 +166,22 @@ def main():
     api_status = "🟢 Conectado" if st.session_state.api_test_status == "success" else "🔴 Não testada" if st.session_state.api_test_status is None else "🔴 Falha na conexão"
     st.sidebar.markdown(f"**Status da API:** {api_status}")
     
-    # Mapeamento de endereços para cada cor
+    # Atualizar mapeamento de pinos
     color_addresses = {
-        "RED": "%QX0.3",
-        "GREEN": "%QX0.6",
-        "BLUE": "%QX0.4"
+        "PIN1": "%QX0.4",
+        "PIN2": "%QX0.6"
     }
     
-    # Inicialização da webcam
-    cap = cv2.VideoCapture(1)
+    # Inicialização da webcam com a câmera selecionada
+    cap = cv2.VideoCapture(selected_camera_index)
+    
+    # Informar sobre a câmera selecionada
+    st.sidebar.info(f"Usando {selected_camera_name} (índice {selected_camera_index})")
     
     # Configurações da janela de detecção
     st.sidebar.header("Configurações da Janela")
-    window_width = st.sidebar.slider("Largura da janela", 50, 500, 500)
-    window_height = st.sidebar.slider("Altura da janela", 50, 500, 500)
+    window_width = st.sidebar.slider("Largura da janela", 50, 500, 200)
+    window_height = st.sidebar.slider("Altura da janela", 50, 500, 200)
     window_x = st.sidebar.slider("Posição X da janela", 0, 600, 250)
     window_y = st.sidebar.slider("Posição Y da janela", 0, 400, 150)
     
@@ -175,13 +211,15 @@ def main():
         # Imprimir porta no terminal (em um thread separado para não bloquear)
         threading.Thread(target=print_running_port).start()
     
-    # Função para desligar o pino após delay
-    def turn_off_red_after_delay():
-        time.sleep(5)  # Espera 5 segundos
-        success, message = send_api_request(api_base_url, color_addresses["RED"], 0)
-        st.session_state.red_timer_active = False
-        if not success:
-            print(f"Falha ao desligar pino vermelho: {message}")
+    # Função para enviar comandos para os dois pinos
+    def send_color_command(api_base_url, pin1_value, pin2_value):
+        """Envia comandos para os dois pinos."""
+        success1, message1 = send_api_request(api_base_url, color_addresses["PIN1"], pin1_value)
+        success2, message2 = send_api_request(api_base_url, color_addresses["PIN2"], pin2_value)
+        if success1 and success2:
+            return True, "Comando enviado com sucesso"
+        else:
+            return False, f"Erro ao enviar comando: {message1}, {message2}"
     
     while not stop_button:
         ret, frame = cap.read()
@@ -250,44 +288,30 @@ def main():
                                        unsafe_allow_html=True)
             
             # Processar estados das cores e enviar comandos
-            if current_color == "RED" and not st.session_state.last_color_state["RED"]:
-                # Vermelho detectado - ativar e iniciar temporizador
-                st.session_state.last_color_state["RED"] = True
-                success, message = send_api_request(api_base_url, color_addresses["RED"], 1)
+            if current_color == "RED":
+                success, message = send_color_command(api_base_url, 1, 0)  # 10
                 if success:
                     command_status_placeholder.success(f"Vermelho ativado: {message}")
-                    st.session_state.red_activation_time = datetime.now()
-                    # Inicia thread para desligar após 5 segundos
-                    if not st.session_state.red_timer_active:
-                        st.session_state.red_timer_active = True
-                        threading.Thread(target=turn_off_red_after_delay).start()
                 else:
                     command_status_placeholder.error(f"Falha ao ativar vermelho: {message}")
-            
-            # Para verde e azul, aciona e desliga baseado na presença/ausência da cor
-            for color_name in ["GREEN", "BLUE"]:
-                is_active = current_color == color_name
-                if is_active != st.session_state.last_color_state[color_name]:
-                    st.session_state.last_color_state[color_name] = is_active
-                    value = 1 if is_active else 0
-                    success, message = send_api_request(api_base_url, color_addresses[color_name], value)
-                    if success:
-                        status = "ativado" if value == 1 else "desativado"
-                        command_status_placeholder.success(f"{color_name} {status}: {message}")
-                    else:
-                        command_status_placeholder.error(f"Falha ao ativar {color_name}: {message}")
-            
-            # Se nada for detectado, verificar se há cores ativas para desligar
-            if current_color == "NONE":
-                # Para vermelho não precisamos fazer nada aqui pois já tem o timer
-                for color_name in ["GREEN", "BLUE"]:
-                    if st.session_state.last_color_state[color_name]:
-                        st.session_state.last_color_state[color_name] = False
-                        success, message = send_api_request(api_base_url, color_addresses[color_name], 0)
-                        if success:
-                            command_status_placeholder.info(f"{color_name} desativado: {message}")
-                        else:
-                            command_status_placeholder.error(f"Falha ao desativar {color_name}: {message}")
+            elif current_color == "GREEN":
+                success, message = send_color_command(api_base_url, 0, 1)  # 01
+                if success:
+                    command_status_placeholder.success(f"Verde ativado: {message}")
+                else:
+                    command_status_placeholder.error(f"Falha ao ativar verde: {message}")
+            elif current_color == "BLUE":
+                success, message = send_color_command(api_base_url, 1, 1)  # 11
+                if success:
+                    command_status_placeholder.success(f"Azul ativado: {message}")
+                else:
+                    command_status_placeholder.error(f"Falha ao ativar azul: {message}")
+            else:  # Nenhuma cor detectada
+                success, message = send_color_command(api_base_url, 0, 0)  # 00
+                if success:
+                    command_status_placeholder.info(f"Nenhuma cor detectada: {message}")
+                else:
+                    command_status_placeholder.error(f"Falha ao desativar pinos: {message}")
             
         # Converter para RGB (Streamlit espera RGB, não BGR usado pelo OpenCV)
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -298,8 +322,7 @@ def main():
         cv2.waitKey(20)
     
     # Desligar todos os pinos ao parar
-    for color_name, address in color_addresses.items():
-        send_api_request(api_base_url, address, 0)
+    send_color_command(api_base_url, 0, 0)
     
     # Liberar a câmera quando terminar
     cap.release()
